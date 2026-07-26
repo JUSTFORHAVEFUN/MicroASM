@@ -1,4 +1,4 @@
-// microasm.cpp - µASM v2 Compiler (NASM + Binary)
+// microasm2.cpp - µASM v2 Compiler (NASM + Binary)
 // g++ -std=c++17 -O2 -o microasm2 microasm2.cpp
 // Usage:
 //   microasm2 input.masm                      -> NASM to stdout
@@ -17,6 +17,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <cstdint>
+#include <algorithm>
 
 using namespace std;
 
@@ -34,7 +35,7 @@ static const map<string, RegInfo> REGISTERS = {
     {"SP",{"sp",2,4}},{"BP",{"bp",2,5}},{"SI",{"si",2,6}},{"DI",{"di",2,7}},
     {"EAX",{"eax",4,0}},{"ECX",{"ecx",4,1}},{"EDX",{"edx",4,2}},{"EBX",{"ebx",4,3}},
     {"ESP",{"esp",4,4}},{"EBP",{"ebp",4,5}},{"ESI",{"esi",4,6}},{"EDI",{"edi",4,7}},
-    // 段寄存器（用于识别，但编码单独处理）
+    // 段寄存器
     {"CS",{"cs",2,1}},{"DS",{"ds",2,3}},{"ES",{"es",2,0}},{"SS",{"ss",2,2}},
     {"FS",{"fs",2,4}},{"GS",{"gs",2,5}}
 };
@@ -124,7 +125,6 @@ private:
             if(peek()=='$') { get(); return base_addr; }
             return cur_addr;
         }
-        // 数字
         string num;
         if(peek()=='-' || peek()=='+') num += get();
         while(isdigit(peek()) || peek()=='x' || peek()=='X' || (peek()>='a' && peek()<='f') || (peek()>='A' && peek()<='F'))
@@ -146,7 +146,6 @@ class MicroAsmCompiler {
 public:
     MicroAsmCompiler() : bits_mode(32), org_base(0) {}
 
-    // ---------- NASM 输出 ----------
     string compile_nasm(istream& in) {
         read_lines(in);
         output.clear();
@@ -170,7 +169,6 @@ public:
         return oss.str();
     }
 
-    // ---------- 二进制输出 ----------
     vector<uint8_t> compile_bin(istream& in) {
         read_lines(in);
         first_pass_binary();
@@ -286,6 +284,8 @@ private:
     int instr_length(const string& line) {
         istringstream iss(line);
         string instr; iss >> instr;
+        for(char& c : instr) c = tolower(c);  // 统一小写
+
         if(instr=="bits") return 0;
         if(instr==">" || instr=="<") return 1;
         if(instr=="+" || instr=="-") return (bits_mode==16?3:2);
@@ -301,23 +301,15 @@ private:
             } else return 1;
         }
         if(instr[0]=='#') return 1 + (bits_mode==32?4:2);
-        // $ and ~ now might have SIB (length estimation extended)
         if(instr[0]=='$' || instr[0]=='~') {
-            // old form: single reg token -> 2 + optional 67h
-            // new form: reg, @... -> base 2 + maybe SIB (1) + disp (1/4)
-            string rest; getline(iss, rest);
-            rest = trim(rest);
+            string rest; getline(iss, rest); rest = trim(rest);
             size_t comma = rest.find(',');
-            if(comma == string::npos) {
-                return 2 + (bits_mode==16?1:0);
-            } else {
-                // SIB form, estimate max: 2(op+modrm) + 1(sib) + 4(disp) + prefixes
-                return 2 + 1 + 4 + (bits_mode==16?1:0) + ((bits_mode==16)?0:0); // rough overestimate
-            }
+            if(comma == string::npos) return 2 + (bits_mode==16?1:0);
+            else return 2 + 1 + 4 + (bits_mode==16?1:0);
         }
         if(instr[0]=='=' || instr[0]=='%') {
             string r = get_op_str(iss,instr,instr[0]);
-            if(is_seg(r)) return 2;  // 8C/8E + modrm
+            if(is_seg(r)) return 2;
             const RegInfo& ri = get_reg(r);
             int base = 2;
             if(ri.size==2 && bits_mode==32) base=3;
@@ -397,138 +389,112 @@ private:
             if((ri.size==2 && bits_mode==32)||(ri.size==4 && bits_mode==16)) base=3;
             return base;
         }
+        if(instr=="mul" || instr=="div" || instr=="imul" || instr=="idiv") {
+            string rest; getline(iss, rest); rest = trim(rest);
+            string dst, src;
+            size_t comma = rest.find(',');
+            if(comma != string::npos) {
+                dst = trim(rest.substr(0, comma));
+                src = trim(rest.substr(comma+1));
+            } else {
+                istringstream rss(rest);
+                rss >> dst;
+                rss >> src; src = trim(src);
+            }
+            if(dst.empty()) throw runtime_error("missing destination register");
+            if(src.empty()) src = "DX";
+            const RegInfo& rd = get_reg(dst);
+            if(rd.size < 2) throw runtime_error("MUL/DIV/IMUL/IDIV requires 16 or 32-bit register");
+            bool is_imm = !is_reg(src);
+            int op_size = rd.size;
+            auto prefix_len = [&](int sz) -> int {
+                if((sz == 2 && bits_mode == 32) || (sz == 4 && bits_mode == 16)) return 1;
+                return 0;
+            };
+            int len = 0;
+            if(instr == "div" || instr == "idiv") len += (instr=="div"?2:1); // xor or cdq/cwd
+            if(is_imm) len += (1 + op_size) + prefix_len(op_size);
+            bool dst_is_acc = (rd.idx == 0) && (rd.size == op_size);
+            if(!dst_is_acc) len += 2 + prefix_len(op_size);
+            len += 2 + prefix_len(op_size);
+            if(!dst_is_acc) len += 2 + prefix_len(op_size);
+            return len;
+        }
         throw runtime_error("unknown length for: " + line);
     }
 
-    /* ---------- SIB 解析辅助 ---------- */
+    /* SIB 辅助 (未改动) */
     struct SIBInfo {
-        uint8_t base;       // base register index
-        uint8_t index;      // index register index (4 if none)
-        uint8_t scale;      // 0-3
-        int64_t disp;       // displacement value
-        bool disp_present;  // true if explicit displacement
-        bool is_label;      // true if displacement is a label
-        string label;       // label name if is_label
+        uint8_t base, index, scale;
+        int64_t disp;
+        bool disp_present, is_label;
+        string label;
     };
 
     SIBInfo parse_sib(const string& expr) {
-        // expr starts with '@'
-        SIBInfo info;
-        info.base = 0;
-        info.index = 4;
-        info.scale = 0;
-        info.disp = 0;
-        info.disp_present = false;
-        info.is_label = false;
-
-        string s = expr.substr(1); // remove '@'
+        SIBInfo info = {0,4,0,0,false,false,""};
+        string s = expr.substr(1);
         vector<string> parts;
         istringstream ss(s);
         string tok;
-        while(getline(ss, tok, ',')) {
-            parts.push_back(trim(tok));
-        }
-        if(parts.empty() || parts.size() > 4) throw runtime_error("invalid SIB expression: " + expr);
-        
-        // field 1: base (required)
-        if(!is_reg(parts[0])) throw runtime_error("SIB base must be register: " + parts[0]);
+        while(getline(ss, tok, ',')) parts.push_back(trim(tok));
+        if(parts.empty() || parts.size() > 4) throw runtime_error("invalid SIB expression");
+        if(!is_reg(parts[0])) throw runtime_error("SIB base must be register");
         info.base = get_reg(parts[0]).idx;
-        
-        // field 2: index (optional)
         if(parts.size() >= 2) {
             string idx = parts[1];
-            if(idx == "0" || idx == "1") {
-                info.index = 4; // no index
-            } else if(is_reg(idx)) {
-                info.index = get_reg(idx).idx;
-            } else {
-                throw runtime_error("SIB index must be register or 0/1: " + idx);
-            }
+            if(idx == "0" || idx == "1") info.index = 4;
+            else if(is_reg(idx)) info.index = get_reg(idx).idx;
+            else throw runtime_error("SIB index must be register or 0/1");
         }
-        
-        // field 3: scale / extra register
-        bool has_second_base = false;
-        uint8_t second_base_idx = 0;
         if(parts.size() >= 3) {
             string scl = parts[2];
-            if(is_reg(scl)) {
-                // "变成 +" mode: use scl as the index with scale 1, ignore original index?
-                // Specification: Index = field3 register, Base = field1, Scale = 0
-                info.index = get_reg(scl).idx;
-                info.scale = 0; // x1
-                has_second_base = false;
-            } else {
-                // numeric or #num
+            if(is_reg(scl)) { info.index = get_reg(scl).idx; info.scale = 0; }
+            else {
                 if(!scl.empty() && scl[0]=='#') scl = scl.substr(1);
                 int64_t scale_val = parse_int(scl);
                 if(scale_val == 1) info.scale = 0;
                 else if(scale_val == 2) info.scale = 1;
                 else if(scale_val == 4) info.scale = 2;
                 else if(scale_val == 8) info.scale = 3;
-                else throw runtime_error("invalid scale: " + scl);
+                else throw runtime_error("invalid scale");
             }
         }
-        
-        // field 4: displacement
         if(parts.size() >= 4) {
             string disp_str = parts[3];
-            if(disp_str == "0" || disp_str == "1") {
-                info.disp_present = false;
-                info.disp = 0;
-            } else {
+            if(disp_str == "0" || disp_str == "1") info.disp_present = false;
+            else {
                 info.disp_present = true;
                 if(!disp_str.empty() && disp_str[0]=='#') disp_str = disp_str.substr(1);
-                // try to parse as integer
                 char* end;
                 int64_t v = strtoll(disp_str.c_str(), &end, 0);
-                if(end && *end) {
-                    // treat as label
-                    info.is_label = true;
-                    info.label = disp_str;
-                    info.disp = 0;
-                } else {
-                    info.is_label = false;
-                    info.disp = v;
-                }
+                if(end && *end) { info.is_label = true; info.label = disp_str; }
+                else info.disp = v;
             }
         }
         return info;
     }
 
-    // NASM output for SIB load/store
     void nasm_sib_load_store(bool is_store, const string& sib_expr, const RegInfo& ri) {
         SIBInfo sib = parse_sib(sib_expr);
         string sz = (ri.size==1)?"byte":((ri.size==2)?"word":dsize());
         string addr = "[";
-        // base
-        string base_name = "eax"; // default
-        for(auto& kv : REGISTERS) if(kv.second.size == 4 && kv.second.idx == sib.base) { base_name = kv.second.name; break; }
+        string base_name = "eax";
+        for(auto& kv : REGISTERS) if(kv.second.size==4 && kv.second.idx==sib.base) { base_name=kv.second.name; break; }
         addr += base_name;
-        // index
         if(sib.index != 4) {
             string idx_name = "eax";
-            for(auto& kv : REGISTERS) if(kv.second.size == 4 && kv.second.idx == sib.index) { idx_name = kv.second.name; break; }
-            if(sib.scale > 0) {
-                addr += "+" + idx_name + "*" + to_string(1<<sib.scale);
-            } else {
-                addr += "+" + idx_name;
-            }
+            for(auto& kv : REGISTERS) if(kv.second.size==4 && kv.second.idx==sib.index) { idx_name=kv.second.name; break; }
+            addr += "+" + idx_name;
+            if(sib.scale > 0) addr += "*" + to_string(1<<sib.scale);
         }
-        // displacement
-        if(sib.is_label) {
-            addr += "+" + sib.label;
-        } else if(sib.disp_present) {
-            if(sib.disp >= 0) addr += "+" + to_string(sib.disp);
-            else addr += to_string(sib.disp); // negative sign included
-        }
+        if(sib.is_label) addr += "+" + sib.label;
+        else if(sib.disp_present) addr += (sib.disp>=0?"+":"") + to_string(sib.disp);
         addr += "]";
-        if(is_store)
-            output.push_back("    mov " + sz + " " + addr + ", " + ri.name);
-        else
-            output.push_back("    mov " + ri.name + ", " + sz + " " + addr);
+        if(is_store) output.push_back("    mov " + sz + " " + addr + ", " + ri.name);
+        else output.push_back("    mov " + ri.name + ", " + sz + " " + addr);
     }
 
-    // Binary encoding for SIB load/store
     void encode_sib_load_store(bool is_store, const string& sib_expr, const RegInfo& ri) {
         SIBInfo sib = parse_sib(sib_expr);
         auto b = [&](uint8_t v){ code_buf.push_back(v); };
@@ -538,66 +504,27 @@ private:
             for(int i=0;i<sz;i++) b(0);
             relocs.push_back({off,sz,lbl,false});
         };
-
-        // Address size prefix
-        if(bits_mode == 16) b(0x67);
-        // Operand size prefix
-        bool need_opsize = false;
-        if((ri.size==2 && bits_mode==32) || (ri.size==4 && bits_mode==16))
-            need_opsize = true;
+        if(bits_mode==16) b(0x67);
+        bool need_opsize = (ri.size==2 && bits_mode==32) || (ri.size==4 && bits_mode==16);
         if(need_opsize) b(0x66);
-
-        uint8_t opcode = (ri.size==1) ? (is_store ? 0x88 : 0x8A) : (is_store ? 0x89 : 0x8B);
-        b(opcode);
-
-        // Determine Mod field
-        uint8_t mod = 0;
-        bool use_disp8 = false;
-        bool use_disp32 = false;
+        b(is_store ? (ri.size==1?0x88:0x89) : (ri.size==1?0x8A:0x8B));
+        uint8_t mod = 0; bool use_disp8=false, use_disp32=false;
         int64_t disp_val = sib.disp;
         if(!sib.disp_present && !sib.is_label) {
-            // no displacement
-            if(sib.base == 5 && sib.index == 4) {
-                // [EBP] must use disp8=0
-                mod = 1;
-                disp_val = 0;
-                use_disp8 = true;
-            } else {
-                mod = 0; // no displacement
-            }
+            if(sib.base==5 && sib.index==4) { mod=1; disp_val=0; use_disp8=true; }
         } else if(sib.is_label) {
-            // label -> always disp32 (Mod=00 if base=5 and index=4, else Mod=10)
-            if(sib.base == 5 && sib.index == 4) {
-                mod = 0;
-            } else {
-                mod = 2;
-            }
-            use_disp32 = true;
+            if(sib.base==5 && sib.index==4) mod=0; else mod=2;
+            use_disp32=true;
         } else {
-            // explicit displacement
-            if(sib.disp >= -128 && sib.disp <= 127) {
-                mod = 1;
-                use_disp8 = true;
-            } else {
-                mod = 2;
-                use_disp32 = true;
-            }
+            if(sib.disp>=-128 && sib.disp<=127) { mod=1; use_disp8=true; }
+            else { mod=2; use_disp32=true; }
         }
-
-        uint8_t modrm = (mod << 6) | (ri.idx << 3) | 4; // r/m=4 for SIB
-        b(modrm);
-
-        uint8_t sib_byte = (sib.scale << 6) | ((sib.index & 7) << 3) | (sib.base & 7);
-        b(sib_byte);
-
-        if(use_disp8) {
-            b((uint8_t)(disp_val & 0xFF));
-        } else if(use_disp32) {
-            if(sib.is_label) {
-                abs_reloc(4, sib.label);
-            } else {
-                w32((uint32_t)disp_val);
-            }
+        b((mod<<6)|(ri.idx<<3)|4);
+        b((sib.scale<<6)|((sib.index&7)<<3)|(sib.base&7));
+        if(use_disp8) b((uint8_t)disp_val);
+        else if(use_disp32) {
+            if(sib.is_label) abs_reloc(4, sib.label);
+            else w32((uint32_t)disp_val);
         }
     }
 
@@ -605,6 +532,8 @@ private:
     void nasm_line(const string& line) {
         istringstream iss(line);
         string instr; iss >> instr;
+        for(char& c : instr) c = tolower(c);  // 大小写不敏感
+
         if(instr=="bits") {
             string mode; iss >> mode;
             if(mode == "16") { bits_mode = 16; output.push_back("[bits 16]"); }
@@ -625,13 +554,11 @@ private:
             part1 = trim(part1);
             part2 = trim(part2);
             if(part2.empty()) {
-                // old form: $ reg
                 const RegInfo& ri = get_reg(part1);
                 string sz = (ri.size==1)?"byte":((ri.size==2)?"word":dsize());
                 output.push_back("    mov "+sz+" ["+ptr()+"], "+ri.name);
             } else {
-                // new SIB form: $ reg, @...
-                if(part2.empty() || part2[0]!='@') throw runtime_error("expected @SIB expression");
+                if(part2[0]!='@') throw runtime_error("expected @SIB expression");
                 const RegInfo& ri = get_reg(part1);
                 nasm_sib_load_store(true, part2, ri);
             }
@@ -647,35 +574,27 @@ private:
                 string sz = (ri.size==1)?"byte":((ri.size==2)?"word":dsize());
                 output.push_back("    mov "+ri.name+", "+sz+" ["+ptr()+"]");
             } else {
-                if(part2.empty() || part2[0]!='@') throw runtime_error("expected @SIB expression");
+                if(part2[0]!='@') throw runtime_error("expected @SIB expression");
                 const RegInfo& ri = get_reg(part1);
                 nasm_sib_load_store(false, part2, ri);
             }
         }
         else if(instr[0]=='=') {
             string r = get_op_str(iss,instr,'=');
-            if(is_seg(r)) {
-                string seg = r; for(char& c:seg) c=tolower(c);
-                output.push_back("    mov "+seg+", "+ptr());
-            } else {
-                output.push_back("    mov "+get_reg(r).name+", "+ptr());
-            }
+            if(is_seg(r)) { string seg=r; for(char& c:seg) c=tolower(c); output.push_back("    mov "+seg+", "+ptr()); }
+            else output.push_back("    mov "+get_reg(r).name+", "+ptr());
         }
         else if(instr[0]=='%') {
             string r = get_op_str(iss,instr,'%');
-            if(is_seg(r)) {
-                string seg = r; for(char& c:seg) c=tolower(c);
-                output.push_back("    mov "+ptr()+", "+seg);
-            } else {
-                output.push_back("    mov "+ptr()+", "+get_reg(r).name);
-            }
+            if(is_seg(r)) { string seg=r; for(char& c:seg) c=tolower(c); output.push_back("    mov "+ptr()+", "+seg); }
+            else output.push_back("    mov "+ptr()+", "+get_reg(r).name);
         }
         else if(instr[0]=='&') output.push_back("    lea "+ptr()+", ["+get_op_str(iss,instr,'&')+"]");
         else if(instr[0]=='^') output.push_back("    in "+get_reg(get_op_str(iss,instr,'^')).name+", "+ptr());
         else if(instr[0]=='*') output.push_back("    out "+ptr()+", "+get_reg(get_op_str(iss,instr,'*')).name);
         else if(instr[0]=='!') output.push_back("    jmp "+get_op_str(iss,instr,'!'));
         else if(instr[0]=='?') {
-            if(instr.size()>=3 && toupper(instr[1])=='N') {
+            if(instr.size()>=3 && tolower(instr[1])=='n') {
                 char c=toupper(instr[2]); string lbl=(instr.size()>3)?instr.substr(3):"";
                 if(lbl.empty()) iss>>lbl;
                 static const string ncc[]={"jnz","jnc","jno","jns","jnp"};
@@ -774,6 +693,77 @@ private:
             string rest; getline(iss,rest); rest=trim(rest);
             size_t c=rest.find(','); output.push_back("    in "+get_reg(trim(rest.substr(0,c))).name+", "+resolve_equ(trim(rest.substr(c+1))));
         }
+        else if(instr=="mul" || instr=="div" || instr=="imul" || instr=="idiv") {
+            string rest; getline(iss, rest); rest = trim(rest);
+            string dst, src;
+            size_t comma = rest.find(',');
+            if(comma != string::npos) {
+                dst = trim(rest.substr(0, comma));
+                src = trim(rest.substr(comma+1));
+            } else {
+                istringstream rss(rest);
+                rss >> dst;
+                rss >> src; src = trim(src);
+            }
+            if(dst.empty()) throw runtime_error("missing destination register");
+            if(src.empty()) src = "DX";
+            const RegInfo& rd = get_reg(dst);
+            if(rd.size < 2) throw runtime_error("MUL/DIV/IMUL/IDIV requires 16 or 32-bit register");
+
+            bool is_imm = !is_reg(src);
+            string src_reg_name;
+            if(is_imm) {
+                string imm_str = src;
+                if(!imm_str.empty() && imm_str[0] == '#') imm_str = imm_str.substr(1);
+                int64_t imm_val = parse_int(imm_str);
+                // 选择一个不被目的寄存器占用的临时寄存器
+                string tname = (rd.size == 2) ? ((rd.name == "bx") ? "cx" : "bx")
+                                             : ((rd.name == "ebx") ? "ecx" : "ebx");
+                output.push_back("    mov " + tname + ", " + to_string(imm_val));
+                src_reg_name = tname;
+            } else {
+                const RegInfo& rs = get_reg(src);
+                if(rs.size != rd.size) throw runtime_error("size mismatch");
+                src_reg_name = rs.name;
+            }
+
+            string acc_reg = (rd.size == 2) ? "ax" : "eax";
+            string high_reg = (rd.size == 2) ? "dx" : "edx";
+            string op_name = instr; // 已转小写
+
+            if(op_name == "mul" || op_name == "imul") {
+                if(rd.name != acc_reg) {
+                    output.push_back("    mov " + acc_reg + ", " + rd.name);
+                    output.push_back("    " + op_name + " " + src_reg_name);
+                    output.push_back("    mov " + rd.name + ", " + acc_reg);
+                } else {
+                    output.push_back("    " + op_name + " " + src_reg_name);
+                }
+            } else { // div / idiv
+                if(op_name == "div") output.push_back("    xor " + high_reg + ", " + high_reg);
+                else { // idiv
+                    string ext_instr = (rd.size == 2) ? "cwd" : "cdq";
+                    if(rd.name != acc_reg) {
+                        output.push_back("    mov " + acc_reg + ", " + rd.name);
+                        output.push_back("    " + ext_instr);
+                        output.push_back("    " + op_name + " " + src_reg_name);
+                        output.push_back("    mov " + rd.name + ", " + acc_reg);
+                    } else {
+                        output.push_back("    " + ext_instr);
+                        output.push_back("    " + op_name + " " + src_reg_name);
+                    }
+                    return;
+                }
+                // div 通用流程
+                if(rd.name != acc_reg) {
+                    output.push_back("    mov " + acc_reg + ", " + rd.name);
+                    output.push_back("    " + op_name + " " + src_reg_name);
+                    output.push_back("    mov " + rd.name + ", " + acc_reg);
+                } else {
+                    output.push_back("    " + op_name + " " + src_reg_name);
+                }
+            }
+        }
         else if(instr=="var") {
             string rest=trim(line.substr(3)); istringstream rss(rest); string name; int sz; rss>>name>>sz;
             data_out.push_back(name+": times "+to_string(sz)+" db 0");
@@ -794,6 +784,7 @@ private:
     void encode_line(const string& line) {
         istringstream iss(line);
         string instr; iss >> instr;
+        for(char& c : instr) c = tolower(c);  // 大小写不敏感
 
         if(instr == "bits") {
             string mode; iss >> mode;
@@ -827,7 +818,6 @@ private:
             part1 = trim(part1);
             part2 = trim(part2);
             if(part2.empty()) {
-                // old form: $ reg
                 const RegInfo& ri = get_reg(part1);
                 if(bits_mode==16) b(0x67); b(0x88); b((0<<6)|(ri.idx<<3)|p);
             } else {
@@ -855,30 +845,24 @@ private:
         } else if(instr[0]=='%') {
             string r = get_op_str(iss,instr,'%');
             if(is_seg(r)) {
-                // mov dx, seg
                 int s = seg_idx(r);
-                b(0x8C);
-                b((3<<6) | (s<<3) | p);
+                b(0x8C); b((3<<6) | (s<<3) | p);
             } else {
                 const RegInfo& ri = get_reg(r);
                 if(ri.size==2 && bits_mode==32) b(0x66);
                 else if(ri.size==4 && bits_mode==16) b(0x66);
-                b(0x89);
-                b((3<<6) | (ri.idx<<3) | p);
+                b(0x89); b((3<<6) | (ri.idx<<3) | p);
             }
         } else if(instr[0]=='=') {
             string r = get_op_str(iss,instr,'=');
             if(is_seg(r)) {
-                // mov seg, dx
                 int s = seg_idx(r);
-                b(0x8E);
-                b((3<<6) | (s<<3) | p);
+                b(0x8E); b((3<<6) | (s<<3) | p);
             } else {
                 const RegInfo& ri = get_reg(r);
                 if(ri.size==2 && bits_mode==32) b(0x66);
                 else if(ri.size==4 && bits_mode==16) b(0x66);
-                b(0x89);
-                b((3<<6) | (p<<3) | ri.idx);
+                b(0x89); b((3<<6) | (p<<3) | ri.idx);
             }
         } else if(instr[0]=='&') {
             string var = get_op_str(iss,instr,'&');
@@ -898,7 +882,7 @@ private:
             string lbl = get_op_str(iss,instr,'!');
             b(0xE9); rel_reloc(bits_mode==32?4:2, lbl);
         } else if(instr[0]=='?') {
-            if(instr.size()>=3 && toupper(instr[1])=='N') {
+            if(instr.size()>=3 && tolower(instr[1])=='n') {
                 char c=toupper(instr[2]); string lbl=(instr.size()>3)?instr.substr(3):"";
                 if(lbl.empty()) iss>>lbl;
                 static uint8_t ncc[256]={0};
@@ -1031,6 +1015,73 @@ private:
             const RegInfo& ri=get_reg(r); int64_t port=parse_int(resolve_equ(imm));
             if(ri.size==1){b(0xE4);b(port);}
             else { if((ri.size==2&&bits_mode==32)||(ri.size==4&&bits_mode==16)) b(0x66); b(0xE5); b(port); }
+        } else if(instr=="mul" || instr=="div" || instr=="imul" || instr=="idiv") {
+            string rest; getline(iss, rest); rest = trim(rest);
+            string dst, src;
+            size_t comma = rest.find(',');
+            if(comma != string::npos) {
+                dst = trim(rest.substr(0, comma));
+                src = trim(rest.substr(comma+1));
+            } else {
+                istringstream rss(rest);
+                rss >> dst;
+                rss >> src; src = trim(src);
+            }
+            if(dst.empty()) throw runtime_error("missing destination register");
+            if(src.empty()) src = "DX";
+            const RegInfo& rd = get_reg(dst);
+            if(rd.size < 2) throw runtime_error("MUL/DIV/IMUL/IDIV requires 16 or 32-bit register");
+
+            bool is_imm = !is_reg(src);
+            int src_idx = 0;
+            if(is_imm) {
+                string imm_str = src;
+                if(!imm_str.empty() && imm_str[0]=='#') imm_str = imm_str.substr(1);
+                int64_t imm_val = parse_int(imm_str);
+                // 选择临时寄存器 (避免冲突)
+                src_idx = (rd.idx == 3) ? 1 : 3; // cx/ecx or bx/ebx
+                auto prefix16_32 = [&]() {
+                    if((rd.size==2 && bits_mode==32) || (rd.size==4 && bits_mode==16)) b(0x66);
+                };
+                prefix16_32();
+                b(0xB8 + src_idx);
+                if(rd.size == 2) w16((uint16_t)imm_val);
+                else w32((uint32_t)imm_val);
+            } else {
+                const RegInfo& rs = get_reg(src);
+                if(rs.size != rd.size) throw runtime_error("size mismatch");
+                src_idx = rs.idx;
+            }
+
+            int acc_idx = 0;
+            bool dst_is_acc = (rd.idx == acc_idx) && (rd.size == rd.size);
+            auto prefix16_32 = [&]() {
+                if((rd.size==2 && bits_mode==32) || (rd.size==4 && bits_mode==16)) b(0x66);
+            };
+
+            if(instr == "div" || instr == "idiv") {
+                if(instr == "div") {
+                    prefix16_32();
+                    b(0x31); b(0xD2); // xor dx/edx, dx/edx
+                } else {
+                    // cwd/cdq
+                    b(0x99); // 根据操作数大小自动变为 cwd 或 cdq
+                }
+            }
+
+            if(!dst_is_acc) {
+                prefix16_32();
+                b(0x89); b((3<<6) | (rd.idx << 3) | acc_idx); // mov acc, rd
+            }
+
+            uint8_t op_ext = (instr=="mul")?4 : ((instr=="imul")?5 : ((instr=="div")?6 : 7));
+            prefix16_32();
+            b(0xF7); b((3<<6) | (op_ext << 3) | src_idx);
+
+            if(!dst_is_acc) {
+                prefix16_32();
+                b(0x89); b((3<<6) | (acc_idx << 3) | rd.idx); // mov rd, acc
+            }
         } else throw runtime_error("unsupported instruction: "+instr);
     }
 
@@ -1096,7 +1147,6 @@ private:
     }
 };
 
-/* ---------- 主程序 ---------- */
 int main(int argc, char* argv[]) {
     ios::sync_with_stdio(false);
     string input, output="-";
