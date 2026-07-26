@@ -86,10 +86,36 @@ Arithmetic:
   cmp DX, imm      cmp edx, imm            Compare DX/EDX with immediate
   inc reg          inc reg                 Increment register
   dec reg          dec reg                 Decrement register
-  mul reg          mul reg                 Unsigned multiply
-  imul reg         imul reg                Signed multiply
-  div reg          div reg                 Unsigned divide
-  idiv reg         idiv reg                Signed divide
+
+  MUL and DIV (unsigned multiply / divide, supported in C++ and Python):
+  These instructions allow a flexible syntax with an optional source operand.
+  If the source is omitted, it defaults to the pointer register (DX in 16-bit,
+  EDX in 32-bit). The destination register acts as both source and result.
+  After MUL, the high part of the product is placed in DX (for 16-bit) or EDX
+  (for 32-bit). After DIV, the remainder is placed in DX/EDX.
+
+  Formats:
+    MUL dest               ; dest = dest * (DX/EDX)  (default source)
+    MUL dest, src          ; dest = dest * src
+    MUL dest, #imm         ; dest = dest * imm
+    DIV dest               ; dest = dest / (DX/EDX)  (default source)
+    DIV dest, src          ; dest = dest / src
+    DIV dest, #imm         ; dest = dest / imm
+
+  - dest must be a 16‑ or 32‑bit general‑purpose register.
+  - src may be a register of the same size or an immediate value (denoted by #,
+    e.g., #10, #0x3F). The immediate can be any expression that resolves to a
+    number.
+  - The comma between operands is optional; whitespace separation is accepted.
+  - For the immediate form, a temporary register is used internally to hold the
+    value; the programmer does not need to worry about it.
+
+  Examples:
+    MUL AX                  ; AX = AX * DX
+    MUL EAX, EBX            ; EAX = EAX * EBX
+    MUL CX, #5              ; CX = CX * 5
+    DIV BX                  ; BX = BX / DX
+    DIV ECX, #0x10          ; ECX = ECX / 0x10
 
 I/O:
   ^reg             in reg, edx             Input from port DX/EDX to register
@@ -183,6 +209,14 @@ Boot sector (16-bit, org 0x7C00):
   ret
   str msg "Hello, World!"
 
+Multiplication and division:
+  bits 32
+  #10            ; EDX = 10
+  =eax           ; EAX = 10
+  mul ebx, #5    ; EBX = EBX * 5
+  mul eax        ; EAX = EAX * EDX
+  div ecx, #3    ; ECX = ECX / 3
+
 Using SIB (C++/Python):
   =ebx
   $ al, @ebx,esi,2,0x100    ; mov [ebx+esi*2+0x100], al
@@ -199,5 +233,6 @@ LIMITATIONS
 - No macro support.
 - No floating-point or SSE instructions.
 - C version: limited instruction set, no SIB, no reg-reg/reg-imm mov, no mul/div.
+- Signed multiply/divide (imul/idiv) are not implemented.
 - Labels and equates are global; no local scoping.
 - Single source file; no linker support.
